@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <errno.h>
 
@@ -62,6 +64,42 @@ static void log_action(const char *district, const char *action)
                      tbuf, g_user, g_role_str, action);
     write(fd, buf, n);
     close(fd);
+}
+
+/* Reads .monitor_pid, sends SIGUSR1 to the monitor, and logs the result. */
+static void notify_monitor(const char *district)
+{
+    int fd = open(".monitor_pid", O_RDONLY);
+    if (fd < 0) {
+        log_action(district, "monitor not notified: no .monitor_pid file");
+        return;
+    }
+
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) {
+        log_action(district, "monitor not notified: could not read PID");
+        return;
+    }
+    buf[n] = '\0';
+
+    pid_t mpid = (pid_t)atoi(buf);
+    if (mpid <= 0) {
+        log_action(district, "monitor not notified: invalid PID in file");
+        return;
+    }
+
+    char action[128];
+    if (kill(mpid, SIGUSR1) < 0) {
+        snprintf(action, sizeof action,
+                 "monitor not notified: kill(%d, SIGUSR1) failed: %s",
+                 (int)mpid, strerror(errno));
+    } else {
+        snprintf(action, sizeof action,
+                 "monitor notified: SIGUSR1 sent to PID %d", (int)mpid);
+    }
+    log_action(district, action);
 }
 
 static int next_report_id(const char *dat_path)
@@ -293,6 +331,7 @@ static int cmd_add(const char *district)
     printf("Report %d added to district '%s'.\n", r.id, district);
     check_symlink(district);
     log_action(district, "add");
+    notify_monitor(district);
     return 0;
 }
 
@@ -526,12 +565,56 @@ static int cmd_filter(const char *district, int nc, char **conds)
     return 0;
 }
 
+/* Deletes a district directory (via fork+execl rm -rf) and its symlink. */
+static int cmd_remove_district(const char *district)
+{
+    if (g_role != ROLE_MANAGER) {
+        fputs("Error: only managers can remove districts\n", stderr);
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(district, &st) < 0) {
+        fprintf(stderr, "Error: district '%s' not found\n", district);
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Error: '%s' is not a district directory\n", district);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+
+    if (pid == 0) {
+        execl("/bin/rm", "rm", "-rf", district, (char *)NULL);
+        perror("execl rm");
+        _exit(1);
+    }
+
+    int wstatus;
+    if (waitpid(pid, &wstatus, 0) < 0) { perror("waitpid"); return -1; }
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+        fprintf(stderr, "Error: rm -rf '%s' failed\n", district);
+        return -1;
+    }
+
+    char link[256];
+    snprintf(link, sizeof link, "active_reports-%s", district);
+    if (unlink(link) < 0 && errno != ENOENT)
+        perror("unlink symlink");
+
+    printf("District '%s' and its symlink removed.\n", district);
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
         fprintf(stderr,
             "Usage: city_manager --role <role> --user <user> --<command> [args...]\n"
-            "  Commands: add, list, view, remove_report, update_threshold, filter\n"
+            "  Commands: add, list, view, remove_report, remove_district,\n"
+            "            update_threshold, filter\n"
             "  Roles:    manager, inspector\n");
         return 1;
     }
@@ -583,6 +666,10 @@ int main(int argc, char *argv[])
             fputs("Usage: --remove_report <district> <report_id>\n", stderr); return 1;
         }
         return cmd_remove_report(district, atoi(argv[cmd_idx + 2])) < 0 ? 1 : 0;
+    }
+    if (strcmp(cmd, "remove_district") == 0) {
+        if (!district) { fputs("Usage: --remove_district <district>\n", stderr); return 1; }
+        return cmd_remove_district(district) < 0 ? 1 : 0;
     }
     if (strcmp(cmd, "update_threshold") == 0) {
         if (!district || cmd_idx + 2 >= argc) {
