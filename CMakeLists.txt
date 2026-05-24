@@ -5,3 +5,5 @@ set(CMAKE_C_STANDARD 99)
 
 add_executable(city_manager main.c)
 add_executable(monitor_reports monitor_reports.c)
+add_executable(city_hub city_hub.c)
+add_executable(scorer scorer.c)
